@@ -208,3 +208,31 @@ def test_stage_flags_match_the_cli_parser():
     dests = {action.dest for action in parser._actions}
     for flag in provisioner.STAGE_FLAGS:
         assert flag in dests, f"etapa {flag} sem flag correspondente no parser"
+
+
+# --------------------------------------------------------------------------- #
+# ensure_path_exports() -- pure filesystem logic (no subprocess)
+# --------------------------------------------------------------------------- #
+def test_path_exports_fallback_creates_bashrc_and_profile(monkeypatch, tmp_path):
+    # Nenhum rc existe -> grava em ~/.bashrc (interativo nao-login) E ~/.profile.
+    monkeypatch.setattr(provisioner, "HOME", tmp_path)
+    provisioner.ensure_path_exports()
+    bashrc = tmp_path / ".bashrc"
+    profile = tmp_path / ".profile"
+    assert bashrc.exists() and profile.exists()
+    assert "# >>> bounty-provisioner >>>" in bashrc.read_text()
+    assert "# >>> bounty-provisioner >>>" in profile.read_text()
+
+
+def test_path_exports_appends_to_existing_rc_without_duplicating(monkeypatch, tmp_path):
+    monkeypatch.setattr(provisioner, "HOME", tmp_path)
+    bashrc = tmp_path / ".bashrc"
+    bashrc.write_text("# existente\n")
+
+    provisioner.ensure_path_exports()
+    provisioner.ensure_path_exports()  # idempotente: segunda chamada nao duplica
+
+    text = bashrc.read_text()
+    assert text.count("# >>> bounty-provisioner >>>") == 1
+    # Como um rc ja existia, o fallback nao deve criar ~/.profile.
+    assert not (tmp_path / ".profile").exists()

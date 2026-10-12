@@ -553,11 +553,12 @@ def ensure_path_exports():
         written = True
 
     if not written:
-        # Nenhum rc existia -- cria ~/.profile para nao perder o PATH silenciosamente.
-        profile = HOME / ".profile"
-        with profile.open("a", encoding="utf-8") as fh:
-            fh.write("\n" + block)
-        ok(f"PATH persistido em {profile} (criado)")
+        # Nenhum rc existia -- grava em ~/.bashrc (bash interativo nao-login) e
+        # ~/.profile (shells de login) para o PATH valer nos dois casos.
+        for rc in (HOME / ".bashrc", HOME / ".profile"):
+            with rc.open("a", encoding="utf-8") as fh:
+                fh.write("\n" + block)
+            ok(f"PATH persistido em {rc} (criado)")
 
 
 def install_go_tools(force, jobs):
@@ -655,8 +656,17 @@ def install_external_tools(update):
             track(name, "failed")
             continue
         req = dest / "requirements.txt"
-        if req.exists() and (update or not existed) and venv_py.exists():
-            run([str(venv_py), "-m", "pip", "install", "-r", str(req)], timeout=900)
+        if req.exists() and (update or not existed):
+            if not venv_py.exists():
+                err(f"{name}: venv indisponivel -- dependencias nao instaladas.")
+                print(f"    {C.RED}[-]{C.RESET} {name} -> {dest} (sem dependencias)")
+                track(name, "failed")
+                continue
+            if not run([str(venv_py), "-m", "pip", "install", "-r", str(req)], timeout=900)[0]:
+                err(f"{name}: falha ao instalar as dependencias no venv.")
+                print(f"    {C.RED}[-]{C.RESET} {name} -> {dest}")
+                track(name, "failed")
+                continue
         track(name, "skipped" if (existed and not update) else "installed")
         print(f"    {C.GREEN}[+]{C.RESET} {name} -> {dest}")
 
@@ -677,19 +687,20 @@ def install_external_tools(update):
             success = run(["curl", "-fsSL", "-o", str(zip_path), f"{base}/findomain-linux.zip"], timeout=900)[0]
             if success:
                 success = run(["unzip", "-o", str(zip_path), "-d", str(tmpdir)], timeout=300)[0]
-            # Verificacao best-effort: a release publica findomain-linux.zip.sha256.
+            # A release publica findomain-linux.zip.sha256. Mesma postura do Go:
+            # sem checksum verificado, nao instalamos o binario (cai no fallback cargo).
             if success:
                 ok_sum, expected_raw, _ = run(
                     ["curl", "-fsSL", f"{base}/findomain-linux.zip.sha256"], timeout=120)
                 expected = expected_raw.split()[0].strip().lower() if ok_sum and expected_raw.strip() else ""
-                if expected:
-                    if sha256_file(zip_path) != expected:
-                        err("  SHA256 do Findomain nao confere -- abortando o binario oficial.")
-                        success = False
-                    else:
-                        ok("  SHA256 do Findomain verificado.")
+                if not expected:
+                    err("  Checksum do Findomain indisponivel -- abortando o binario oficial.")
+                    success = False
+                elif sha256_file(zip_path) != expected:
+                    err("  SHA256 do Findomain nao confere -- abortando o binario oficial.")
+                    success = False
                 else:
-                    warn("  Checksum do Findomain indisponivel -- prosseguindo sem verificar.")
+                    ok("  SHA256 do Findomain verificado.")
             if success:
                 run(["chmod", "+x", str(bin_path)], timeout=60)
                 success = run(sudo_wrap(["mv", str(bin_path), str(LOCAL_BIN / "findomain")]), timeout=60)[0]
@@ -723,19 +734,23 @@ def install_external_tools(update):
         ("gf-secrets", "https://github.com/dwisiswant0/gf-secrets.git"),
     ):
         dest = TOOLS_DIR / name
-        if git_sync(repo, dest, update=update):
-            try:
-                for pattern_file in dest.rglob("*.json"):
-                    shutil.copy2(pattern_file, gf_dir / pattern_file.name)
-                print(f"    {C.GREEN}[+]{C.RESET} {name} -> {gf_dir}")
-                track(name, "installed")
-            except OSError as exc:
-                log(f"ERR  copia dos padroes gf ({name}): {exc}")
-                print(f"    {C.RED}[-]{C.RESET} {name}")
-                track(name, "failed")
-        else:
+        if not git_sync(repo, dest, update=update):
             print(f"    {C.RED}[-]{C.RESET} {name}")
             track(name, "failed")
+            continue
+        # Copia cada padrao de forma independente -- um arquivo problematico nao
+        # deve abortar os demais (comportamento do antigo `find ... -exec cp`).
+        copied = 0
+        for pattern_file in dest.rglob("*.json"):
+            if not pattern_file.is_file():
+                continue
+            try:
+                shutil.copy2(pattern_file, gf_dir / pattern_file.name)
+                copied += 1
+            except OSError as exc:
+                log(f"ERR  copia do padrao gf {pattern_file.name} ({name}): {exc}")
+        print(f"    {C.GREEN}[+]{C.RESET} {name} -> {gf_dir} ({copied} padroes)")
+        track(name, "installed")
 
     # --- Templates do nuclei -------------------------------------------------
     if have("nuclei"):
