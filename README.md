@@ -18,9 +18,9 @@ Configurar uma infraestrutura de *Bug Bounty* é uma tarefa repetitiva e propens
 | **Preflight** | Valida plataforma, `sudo`, `git/curl/wget` e o toolchain Go **antes** de começar. Instala o Go oficial se estiver ausente ou desatualizado (< 1.21). |
 | **Sistema** | Atualiza o `apt` e instala dependências críticas (`libpcap`, `build-essential`, `unzip`, `jq`, `chromium`, `nmap`...). |
 | **Estrutura** | Cria um espaço de trabalho `~/bounty` padronizado (`tools`, `targets`, `wordlists`) e persiste o `PATH` no `.bashrc`/`.zshrc`/`.profile`. |
-| **Ferramentas Go** | Instala **85 ferramentas** em Go, agrupadas por etapa do pipeline de recon, em paralelo (`--jobs`). |
+| **Ferramentas Go** | Instala **85 ferramentas** em Go (a contagem autoritativa é a de `--list`), agrupadas por etapa do pipeline de recon, em paralelo (`--jobs`). |
 | **Python (pipx)** | Instala ferramentas Python em ambientes isolados para evitar o "inferno das dependências" (Arjun, Waymore, ParamSpider, Sqlmap...). |
-| **Ferramentas Externas** | Clona e compila o que exige configuração manual (LinkFinder, SecretFinder, MassDNS, Findomain, padrões do `gf`) e atualiza os templates do Nuclei. |
+| **Ferramentas Externas** | Clona e compila o que exige configuração manual (LinkFinder, SecretFinder, MassDNS, Findomain, padrões do `gf`) e atualiza os templates do Nuclei. As dependências de LinkFinder/SecretFinder vão para um venv dedicado (`~/bounty/tools/.venv`), sem poluir o Python do sistema. |
 | **Wordlists** | Baixa listas de alta qualidade: SecLists, OneListForAll, fuzzdb, Assetnote e Trickest Resolvers. |
 | **Idempotência** | Pula tudo que já está instalado. Use `--force` para reinstalar/atualizar. |
 | **Relatório + Log** | Resumo final de instalados/pulados/falhas e log completo em `~/bounty/provisioner.log`. |
@@ -69,9 +69,14 @@ O código de saída é `1` se qualquer item falhar — útil para CI ou `cloud-i
 ~/bounty/
 ├── targets/           # Relatórios de varredura e dados específicos do domínio
 ├── tools/             # Ferramentas instaladas via Git/Wget (LinkFinder, MassDNS...)
+│   └── .venv/         # venv dedicado para as dependências de LinkFinder/SecretFinder
 ├── wordlists/         # Listas essenciais (SecLists, Assetnote, Resolvers)
 └── provisioner.log    # Log completo da última execução
 ```
+
+> **LinkFinder / SecretFinder:** execute-os com o interpretador do venv, por exemplo
+> `~/bounty/tools/.venv/bin/python ~/bounty/tools/LinkFinder/linkfinder.py -h`
+> (o provisioner imprime esse caminho ao final da etapa `--external`).
 
 ## 🔄 Mudanças da v1.0 → v2.0
 

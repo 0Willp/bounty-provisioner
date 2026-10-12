@@ -17,11 +17,14 @@ Melhorias sobre a v1.0:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -373,6 +376,36 @@ def go_version():
     return None
 
 
+def sha256_file(path: Path):
+    """SHA256 em hex de um arquivo, lendo em blocos."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def go_release_sha256(tag, filename):
+    """SHA256 oficial de `filename` para a release `tag`, via go.dev/dl/?mode=json.
+
+    Retorna o hex esperado ou None se nao for possivel descobrir.
+    """
+    success, out, _ = run(["curl", "-fsSL", "https://go.dev/dl/?mode=json&include=all"], timeout=120)
+    if not success or not out.strip():
+        return None
+    try:
+        releases = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    for release in releases:
+        if release.get("version") != tag:
+            continue
+        for item in release.get("files", []):
+            if item.get("filename") == filename and item.get("sha256"):
+                return item["sha256"]
+    return None
+
+
 def ensure_go():
     """Garante um toolchain Go >= MIN_GO. Instala o tarball oficial se preciso."""
     current = go_version()
@@ -392,17 +425,32 @@ def ensure_go():
         err("Nao foi possivel descobrir a versao mais recente do Go. Instale manualmente: https://go.dev/dl/")
         return False
 
-    tarball = f"/tmp/{tag}.linux-{arch}.tar.gz"
-    url = f"https://go.dev/dl/{tag}.linux-{arch}.tar.gz"
-    info(f"Baixando {tag} ({arch})...")
-    if not run(["curl", "-fsSL", "-o", tarball, url], timeout=1800)[0]:
-        err("Falha no download do Go.")
-        return False
+    filename = f"{tag}.linux-{arch}.tar.gz"
+    url = f"https://go.dev/dl/{filename}"
+    tmpdir = Path(tempfile.mkdtemp(prefix="bounty-go-"))
+    tarball = tmpdir / filename
+    try:
+        info(f"Baixando {tag} ({arch})...")
+        if not run(["curl", "-fsSL", "-o", str(tarball), url], timeout=1800)[0]:
+            err("Falha no download do Go.")
+            return False
 
-    run(sudo_wrap(["rm", "-rf", "/usr/local/go"]))
-    if not run(sudo_wrap(["tar", "-C", "/usr/local", "-xzf", tarball]), timeout=900)[0]:
-        err("Falha ao extrair o Go.")
-        return False
+        expected = go_release_sha256(tag, filename)
+        if expected is None:
+            err(f"Nao foi possivel obter o SHA256 oficial de {filename}. Abortando por seguranca.")
+            return False
+        actual = sha256_file(tarball)
+        if actual != expected:
+            err(f"SHA256 do Go nao confere ({actual[:12]}... != {expected[:12]}...). Abortando.")
+            return False
+        ok("SHA256 do tarball do Go verificado.")
+
+        run(sudo_wrap(["rm", "-rf", "/usr/local/go"]))
+        if not run(sudo_wrap(["tar", "-C", "/usr/local", "-xzf", str(tarball)]), timeout=900)[0]:
+            err("Falha ao extrair o Go.")
+            return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     os.environ["PATH"] = f"/usr/local/go/bin:{os.environ.get('PATH', '')}"
     ok(f"Go {tag} instalado em /usr/local/go.")
@@ -491,14 +539,25 @@ def ensure_path_exports():
         "# <<< bounty-provisioner <<<",
         "",
     ])
-    for rc in (HOME / ".bashrc", HOME / ".zshrc", HOME / ".profile"):
+    rc_files = (HOME / ".bashrc", HOME / ".zshrc", HOME / ".profile")
+    written = False
+    for rc in rc_files:
         if not rc.exists():
             continue
         if marker in rc.read_text(encoding="utf-8", errors="ignore"):
+            written = True
             continue
         with rc.open("a", encoding="utf-8") as fh:
             fh.write("\n" + block)
         ok(f"PATH persistido em {rc}")
+        written = True
+
+    if not written:
+        # Nenhum rc existia -- cria ~/.profile para nao perder o PATH silenciosamente.
+        profile = HOME / ".profile"
+        with profile.open("a", encoding="utf-8") as fh:
+            fh.write("\n" + block)
+        ok(f"PATH persistido em {profile} (criado)")
 
 
 def install_go_tools(force, jobs):
@@ -577,6 +636,14 @@ def install_external_tools(update):
     TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 
     # --- Scripts Python standalone (LinkFinder / SecretFinder) ---------------
+    # Dependencias ficam num venv dedicado em vez de poluir o Python do sistema
+    # (coerente com o isolamento que o pipx da as outras ferramentas Python).
+    venv_dir = TOOLS_DIR / ".venv"
+    venv_py = venv_dir / "bin" / "python"
+    if not venv_py.exists():
+        if not run([sys.executable, "-m", "venv", str(venv_dir)], timeout=300)[0]:
+            warn("Falha ao criar o venv de ferramentas -- requirements de LinkFinder/SecretFinder serao pulados.")
+
     for name, repo in (
         ("LinkFinder", "https://github.com/GerbenJavado/LinkFinder.git"),
         ("SecretFinder", "https://github.com/m4ll0k/SecretFinder.git"),
@@ -588,10 +655,13 @@ def install_external_tools(update):
             track(name, "failed")
             continue
         req = dest / "requirements.txt"
-        if req.exists() and (update or not existed):
-            run([sys.executable, "-m", "pip", "install", "-r", str(req), "--break-system-packages"], timeout=900)
+        if req.exists() and (update or not existed) and venv_py.exists():
+            run([str(venv_py), "-m", "pip", "install", "-r", str(req)], timeout=900)
         track(name, "skipped" if (existed and not update) else "installed")
         print(f"    {C.GREEN}[+]{C.RESET} {name} -> {dest}")
+
+    if venv_py.exists():
+        print(f"    {C.DIM}Rode LinkFinder/SecretFinder com: {venv_py} <script.py>{C.RESET}")
 
     # --- Findomain: binario oficial, cargo como fallback ---------------------
     if shutil.which("findomain") and not update:
@@ -599,14 +669,32 @@ def install_external_tools(update):
         track("findomain", "skipped")
     else:
         info("  Findomain: baixando o binario oficial...")
-        zip_path = "/tmp/findomain-linux.zip"
-        url = "https://github.com/findomain/findomain/releases/latest/download/findomain-linux.zip"
-        success = run(["curl", "-fsSL", "-o", zip_path, url], timeout=900)[0]
-        if success:
-            success = run(["unzip", "-o", zip_path, "-d", "/tmp"], timeout=300)[0]
-        if success:
-            run(["chmod", "+x", "/tmp/findomain"], timeout=60)
-            success = run(sudo_wrap(["mv", "/tmp/findomain", str(LOCAL_BIN / "findomain")]), timeout=60)[0]
+        base = "https://github.com/findomain/findomain/releases/latest/download"
+        tmpdir = Path(tempfile.mkdtemp(prefix="bounty-findomain-"))
+        zip_path = tmpdir / "findomain-linux.zip"
+        bin_path = tmpdir / "findomain"
+        try:
+            success = run(["curl", "-fsSL", "-o", str(zip_path), f"{base}/findomain-linux.zip"], timeout=900)[0]
+            if success:
+                success = run(["unzip", "-o", str(zip_path), "-d", str(tmpdir)], timeout=300)[0]
+            # Verificacao best-effort: a release publica findomain-linux.zip.sha256.
+            if success:
+                ok_sum, expected_raw, _ = run(
+                    ["curl", "-fsSL", f"{base}/findomain-linux.zip.sha256"], timeout=120)
+                expected = expected_raw.split()[0].strip().lower() if ok_sum and expected_raw.strip() else ""
+                if expected:
+                    if sha256_file(zip_path) != expected:
+                        err("  SHA256 do Findomain nao confere -- abortando o binario oficial.")
+                        success = False
+                    else:
+                        ok("  SHA256 do Findomain verificado.")
+                else:
+                    warn("  Checksum do Findomain indisponivel -- prosseguindo sem verificar.")
+            if success:
+                run(["chmod", "+x", str(bin_path)], timeout=60)
+                success = run(sudo_wrap(["mv", str(bin_path), str(LOCAL_BIN / "findomain")]), timeout=60)[0]
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         if not success and shutil.which("cargo"):
             warn("  Binario indisponivel -- compilando com cargo (demora).")
             success = run(["cargo", "install", "findomain"], timeout=3600)[0]
@@ -636,9 +724,15 @@ def install_external_tools(update):
     ):
         dest = TOOLS_DIR / name
         if git_sync(repo, dest, update=update):
-            run(f'find "{dest}" -name "*.json" -exec cp -f {{}} "{gf_dir}/" \\;', timeout=120)
-            print(f"    {C.GREEN}[+]{C.RESET} {name} -> {gf_dir}")
-            track(name, "installed")
+            try:
+                for pattern_file in dest.rglob("*.json"):
+                    shutil.copy2(pattern_file, gf_dir / pattern_file.name)
+                print(f"    {C.GREEN}[+]{C.RESET} {name} -> {gf_dir}")
+                track(name, "installed")
+            except OSError as exc:
+                log(f"ERR  copia dos padroes gf ({name}): {exc}")
+                print(f"    {C.RED}[-]{C.RESET} {name}")
+                track(name, "failed")
         else:
             print(f"    {C.RED}[-]{C.RESET} {name}")
             track(name, "failed")
